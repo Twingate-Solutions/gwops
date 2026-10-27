@@ -1,0 +1,45 @@
+# Golden fixture: render_gateway_config(minimal single-cluster state,
+# Capabilities(gateway_version="2.0.0"), RuntimePaths.from_settings(GwopsSettings())
+# extended with the `solo` credential copies named below).
+# The gateway 2.0 config shape: tls nests under certificates.files[0], the SSH CA key
+# renders at ssh.ca.local, and the recording cap renders at
+# log.sessionRecording.segment.maxSize. Compared structurally (parsed YAML) by
+# tests/renderer/test_render.py, and validated against a real gateway binary by
+# `make preflight-ci`.
+twingate:
+  network: acme2
+  host: twingate.com
+port: 8443
+metricsPort: 9090
+tls:
+  certificates:
+    files:
+      - certificateFile: /data/pki/leaf/fullchain.pem
+        privateKeyFile: /data/pki/leaf/privkey.pem
+log:
+  sessionRecording:
+    # 256,000-byte recording-line cap: the gateway's own validation ceiling for
+    # segment.maxSize (see render.py's module docstring).
+    segment:
+      maxSize: 256000
+ssh:
+  gateway:
+    username: gateway
+    key:
+      type: ed25519
+    hostCertificate:
+      ttl: 24h
+    userCertificate:
+      ttl: 5m
+  ca:
+    local:
+      privateKeyFile: /data/pki/ssh-ca.key
+kubernetes:
+  upstreams:
+    # Credential paths are the gwops-managed content-addressed copies the reconciler
+    # materializes (<name>-token-<sha12>, <name>-ca-<sha12>.crt), not the seed's source
+    # paths under /config/k8s-creds. Both are absent in CI, which is the expected
+    # step-3 startup failure `make preflight-ci` classifies:
+    - name: solo
+      bearerTokenFile: /data/k8s-creds/solo-token-0123456789ab
+      caFile: /data/k8s-creds/solo-ca-fedcba987654.crt

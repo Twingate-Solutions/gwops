@@ -1,0 +1,30 @@
+# Local-only docs, archive and Claude config
+/docs/
+/archive/
+/.claude/
+/CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# Local env / secrets
+.env
+*.local
+
+# Live integration rig: per-run state, tokens and service-account key
+/tests/integration/webapp/.run/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Local starter seed
+/seed.yaml

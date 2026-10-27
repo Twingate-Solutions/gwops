@@ -1,0 +1,275 @@
+# Live web-app rig stack. Driven by tests/integration/webapp/run.py, which supplies every RIG_*
+# variable and the run-dir env files; do not `up` it by hand. Stage 1 (default profile) starts
+# gwops, the connector and the echo upstreams; stage 2 (profile `stage2`) starts the verifiers,
+# the headless client and curl once the web-app ids and the access grant exist.
+#
+# Third-party images are pinned by tag and index digest. The gwops image comes from `make image`
+# (local tag, never pushed). The verifier is built from ./verifier, never pushed.
+# Opt-in profiles: `gatorcast` (Gatorcast plus an ingest tap that logs what gwops ships, started
+# by --gatorcast; the Gatorcast image is Twingate Solutions' own, pulled by its tag) and `ssh`
+# (an sshd target for the recording-size proof, started by --gatorcast-ssh).
+
+x-hardened: &hardened
+  security_opt:
+    - "no-new-privileges:true"
+  cap_drop:
+    - ALL
+
+x-limits: &limits
+  mem_limit: 256m
+  pids_limit: 256
+
+x-echo-image: &echo-image python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+
+x-verifier: &verifier
+  <<: [*hardened, *limits]
+  profiles: ["stage2"]
+  read_only: true
+  tmpfs:
+    - /tmp:mode=1777
+  build:
+    context: ./verifier
+  image: gwops-rig-verifier:local
+  environment:
+    TWINGATE_NETWORK: ${RIG_TWINGATE_NETWORK:-}
+    TWINGATE_HOST: ${RIG_TWINGATE_HOST:-twingate.com}
+    GAT_EXPECTED_RESOURCE_ID: ${RIG_VERIFIER_EXPECTED_ID:-}
+    VERIFIER_TLS_CERT: /pki/verifier.crt
+    VERIFIER_TLS_KEY: /pki/verifier.key
+  volumes:
+    - ${RIG_RUN_DIR:?set RIG_RUN_DIR}/pki:/pki:ro
+
+services:
+  # The `make image` result plus a shim that merges the gateway's stderr into stdout, so its log
+  # lines reach `docker logs` as gateway.line. That stream carries client request headers verbatim,
+  # and the gateway emits recording payloads whatever recording.enabled says; run.log is kept clean
+  # by rig/logfilter.py (header and query scrubbing) plus the redactor.
+  gwops:
+    <<: [*hardened, *limits]
+    mem_limit: 512m
+    build:
+      context: ./gwops-shim
+      args:
+        BASE_IMAGE: ${RIG_GWOPS_IMAGE:-gwops-gateway:dev}
+    image: gwops-rig-gwops:local
+    container_name: ${RIG_PROJECT:?set RIG_PROJECT}-gwops
+    read_only: true
+    tmpfs:
+      - /run/gateway:mode=1777
+      - /tmp:mode=1777
+    env_file:
+      - ${RIG_RUN_DIR:?set RIG_RUN_DIR}/gwops.env
+    environment:
+      GWOPS_SEED_PATH: /config/seed/seed.yaml
+      GWOPS_GATEWAY_BINARY: ${RIG_GATEWAY_SHIM:?set RIG_GATEWAY_SHIM}
+      GWOPS_RECONCILE_TICK_SECONDS: "120"
+    volumes:
+      - ${RIG_RUN_DIR}/seed:/config/seed:ro
+      - ${RIG_RUN_DIR}/webapp-cas:/config/webapp-cas:ro
+      - gwdata:/data
+    ports:
+      - "127.0.0.1:${RIG_ADMIN_PORT:?set RIG_ADMIN_PORT}:8081"
+    networks:
+      default:
+        aliases:
+          - ${RIG_GW_HOST:?set RIG_GW_HOST}
+      backend: {}
+
+  connector:
+    <<: [*hardened, *limits]
+    image: twingate/connector:1.93.0@sha256:44e0ac9385438966a3b476c381ff23e432cf85fd419b8f839cbd8f00dd4d07e4
+    container_name: ${RIG_PROJECT}-connector
+    restart: "no"
+    env_file:
+      - ${RIG_RUN_DIR}/connector.env
+    sysctls:
+      net.ipv4.ping_group_range: "0 2147483647"
+    networks:
+      - default
+      - backend
+
+  echo-http:
+    <<: [*hardened, *limits]
+    image: *echo-image
+    container_name: ${RIG_PROJECT}-echo-http
+    read_only: true
+    command: ["python", "/app/echo.py"]
+    environment:
+      ECHO_HTTP_PORT: "80"
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    user: "10001:10001"
+    volumes:
+      - ./echo.py:/app/echo.py:ro
+    networks:
+      backend:
+        aliases:
+          - ${RIG_PLAIN_HOST:?set RIG_PLAIN_HOST}
+
+  echo-tls:
+    <<: [*hardened, *limits]
+    image: *echo-image
+    container_name: ${RIG_PROJECT}-echo-tls
+    read_only: true
+    command: ["python", "/app/echo.py"]
+    environment:
+      ECHO_HTTPS_PORT: "443"
+      ECHO_CERT: /pki/echo.crt
+      ECHO_KEY: /pki/echo.key
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    user: "10001:10001"
+    volumes:
+      - ./echo.py:/app/echo.py:ro
+      - ${RIG_RUN_DIR}/pki:/pki:ro
+    networks:
+      backend:
+        aliases:
+          - ${RIG_TLS_HOST:?set RIG_TLS_HOST}
+          - ${RIG_ALIAS_HOST:?set RIG_ALIAS_HOST}
+
+  # Same-CA leaf whose SAN matches none of the names below: verify_ca passes, verify_full fails.
+  echo-wrong:
+    <<: [*hardened, *limits]
+    image: *echo-image
+    container_name: ${RIG_PROJECT}-echo-wrong
+    read_only: true
+    command: ["python", "/app/echo.py"]
+    environment:
+      ECHO_HTTPS_PORT: "443"
+      ECHO_CERT: /pki/wrong-host.crt
+      ECHO_KEY: /pki/wrong-host.key
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    user: "10001:10001"
+    volumes:
+      - ./echo.py:/app/echo.py:ro
+      - ${RIG_RUN_DIR}/pki:/pki:ro
+    networks:
+      backend:
+        aliases:
+          - ${RIG_VCA_HOST:?set RIG_VCA_HOST}
+          - ${RIG_WRONGFULL_HOST:?set RIG_WRONGFULL_HOST}
+          - ${RIG_INSECURE_HOST:?set RIG_INSECURE_HOST}
+
+  # --gatorcast: the real Gatorcast sink. gwops ships through ingest-tap, not directly. The ingest
+  # token and UI password come from the run's gatorcast.env (0600, emptied and deleted at teardown).
+  gatorcast:
+    <<: [*hardened, *limits]
+    mem_limit: 512m
+    profiles: ["gatorcast"]
+    image: ${RIG_GATORCAST_IMAGE:?set RIG_GATORCAST_IMAGE}
+    container_name: ${RIG_PROJECT}-gatorcast
+    env_file:
+      - ${RIG_RUN_DIR}/gatorcast.env
+    environment:
+      HTTP_PORT: "8080"
+      DATA_DIR: /data
+      LOG_LEVEL: info
+      UI_AUTH_USERNAME: rig
+    volumes:
+      - gatorcast-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz').status==200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - default
+
+  # Forwards POST /ingest to gatorcast and logs per-line metadata (never content) to
+  # <run dir>/tap/ingest.jsonl: the record of exactly what gwops shipped.
+  ingest-tap:
+    <<: [*hardened, *limits]
+    mem_limit: 512m
+    profiles: ["gatorcast"]
+    image: *echo-image
+    container_name: ${RIG_PROJECT}-ingest-tap
+    read_only: true
+    user: "10001:10001"
+    command: ["python", "/app/ingest_tap.py"]
+    environment:
+      TAP_LISTEN_PORT: "8080"
+      TAP_UPSTREAM: http://gatorcast:8080
+      TAP_LOG: /tap/ingest.jsonl
+    tmpfs:
+      - /tmp:mode=1777
+    volumes:
+      - ./ingest_tap.py:/app/ingest_tap.py:ro
+      - ${RIG_RUN_DIR}/tap:/tap
+    networks:
+      - default
+
+  # --gatorcast-ssh: sshd that trusts the run's gwops SSH CA; reached only through the gateway.
+  ssh-target:
+    <<: [*hardened, *limits]
+    profiles: ["ssh"]
+    build:
+      context: ./ssh-target
+    image: gwops-rig-ssh-target:local
+    container_name: ${RIG_PROJECT}-ssh-target
+    tmpfs:
+      - /tmp:mode=1777
+    volumes:
+      - ${RIG_RUN_DIR}/ssh-ca:/ca:ro
+    networks:
+      backend:
+        aliases:
+          - ${RIG_SSH_HOST:?set RIG_SSH_HOST}
+
+  # Both verifiers expect verifier-a's resource id, so a GAT minted for verifier-b is the
+  # "other app's GAT" and must be rejected on resource.id.
+  verifier-a:
+    <<: *verifier
+    container_name: ${RIG_PROJECT}-verifier-a
+    networks:
+      default:
+        aliases:
+          - ${RIG_VERIFIER_A_HOST:-verifier-a.invalid}
+
+  verifier-b:
+    <<: *verifier
+    container_name: ${RIG_PROJECT}-verifier-b
+    networks:
+      default:
+        aliases:
+          - ${RIG_VERIFIER_B_HOST:-verifier-b.invalid}
+
+  # Non-debug build: the debug variant only adds diagnostics tools; the rig's curl is a separate
+  # container sharing this network namespace, so nothing here needs them.
+  client:
+    <<: [*hardened, *limits]
+    image: twingate/client:2026.239@sha256:1d6c463965b8df42a70f3e7d476cf5eeab6c493f97d95271d2c51d8fa9f17e8e
+    container_name: ${RIG_PROJECT}-client
+    profiles: ["stage2"]
+    env_file:
+      - ${RIG_RUN_DIR}/client.env
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+  curl:
+    <<: [*hardened, *limits]
+    read_only: true
+    mem_limit: 64m
+    image: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
+    container_name: ${RIG_PROJECT}-curl
+    profiles: ["stage2"]
+    network_mode: "service:client"
+    entrypoint: ["sleep", "infinity"]
+    depends_on:
+      - client
+    volumes:
+      - ${RIG_RUN_DIR}/trust:/trust:ro
+
+networks:
+  default: {}
+  # Echo upstreams: no route out of the project. gwops and the connector sit on both networks.
+  backend:
+    internal: true
+
+volumes:
+  gwdata:
+  gatorcast-data:

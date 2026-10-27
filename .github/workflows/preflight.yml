@@ -1,0 +1,443 @@
+name: preflight
+
+# Preflight validation: render gwops's golden configs and validate them against two
+# twingate/gateway binaries to catch config-schema breaks early.
+#
+# Two parallel legs test both the floating twingate/gateway:dev tag (to catch new preview
+# breaks before release) and the pinned GATEWAY_TAG@GATEWAY_DIGEST from the Dockerfile
+# (to ensure the shipped binary is compatible).
+#
+# The resolve and resolve-pinned jobs each:
+# - Resolve their tag to an immutable digest (dev from Docker Hub, pinned from Dockerfile)
+# - Validate tag format and digest format (sha256:<64 hex>)
+# - Pull and extract the binary by digest (immutable)
+# - Upload the binary as an artifact and expose digests as outputs and in $GITHUB_STEP_SUMMARY
+# - Fail if resolve, pull, extract, or digest validation fails; no skip paths; no `continue-on-error`
+#
+# The preflight and preflight-pinned jobs (depend on their respective resolve jobs,
+# reference no secrets) each run gwops.ci.preflight against the extracted binary and
+# golden configs. Same five steps, same expectations, in the same order:
+# 1. Preflight golden - minimal (credential files absent, expected startup failure)
+# 2. Preflight golden - webapp (headers accepted, bundle absent)
+# 3. Preflight canary - bad CA bundle
+# 4. Preflight canary - bad template key
+# 5. Preflight golden - on-demand TLS issuance (with throwaway PKI)
+#
+# Classification is strict for each:
+#   - Healthy: the gateway came up on the config (PASS)
+#   - Expected startup failure: the gateway got past config load and validation and
+#     failed at proxy creation on runtime files absent from the runner (PASS)
+#   - Schema break: the binary rejected the config at load or validation (FAIL)
+#   - Unrecognized failure: anything else, e.g. an early exit 0, a usage error, a panic
+#     or a binary that will not exec; stderr is logged (FAIL)
+#
+# ── To enable Docker Hub pulls ──
+# If twingate/gateway:dev requires auth, add DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
+# secrets to this repo (Settings → Secrets and variables → Actions).
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - "Makefile"
+      - "requirements.lock"
+      - "pyproject.toml"
+      - "src/gwops/renderer/**"
+      - "src/gwops/ci/**"
+      - "src/gwops/supervisor/spawn.py"
+      - "tests/fixtures/rendered/**"
+      - ".github/workflows/preflight.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      index_digest: ${{ steps.resolve_dev.outputs.index_digest }}
+      amd64_digest: ${{ steps.resolve_dev.outputs.amd64_digest }}
+    steps:
+      - name: Checkout gwops (minimal, for artifact upload)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Log in to Docker Hub (if secrets present)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve twingate/gateway:dev digests
+        id: resolve_dev
+        run: |
+          set -euo pipefail
+          INDEX_JSON=$(docker buildx imagetools inspect twingate/gateway:dev --format '{{json .Manifest}}')
+          INDEX_DIGEST=$(echo "$INDEX_JSON" | jq -er '.digest')
+          AMD64_DIGEST=$(echo "$INDEX_JSON" | jq -er '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest')
+
+          # Validate both digests match the expected format before writing to output
+          if ! printf %s "$INDEX_DIGEST" | grep -Ezq '^sha256:[0-9a-f]{64}$'; then
+            echo "ERROR: INDEX_DIGEST $INDEX_DIGEST does not match sha256:<64 hex>" >&2
+            exit 1
+          fi
+          if ! printf %s "$AMD64_DIGEST" | grep -Ezq '^sha256:[0-9a-f]{64}$'; then
+            echo "ERROR: AMD64_DIGEST $AMD64_DIGEST does not match sha256:<64 hex>" >&2
+            exit 1
+          fi
+
+          echo "index_digest=$INDEX_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "amd64_digest=$AMD64_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "twingate/gateway:dev index:       $INDEX_DIGEST"
+          echo "twingate/gateway:dev linux/amd64: $AMD64_DIGEST"
+          {
+            echo "## Gateway \`dev\` tested"
+            echo ""
+            echo "- Index digest: \`$INDEX_DIGEST\`"
+            echo "- linux/amd64 manifest: \`$AMD64_DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pull gateway dev binary
+        env:
+          AMD64_DIGEST: ${{ steps.resolve_dev.outputs.amd64_digest }}
+        run: |
+          set -euo pipefail
+          docker pull "twingate/gateway@$AMD64_DIGEST"
+
+      - name: Extract gateway dev binary
+        env:
+          AMD64_DIGEST: ${{ steps.resolve_dev.outputs.amd64_digest }}
+        run: |
+          set -euo pipefail
+          CONTAINER=$(docker create "twingate/gateway@$AMD64_DIGEST")
+          docker cp "${CONTAINER}:/gateway" "/tmp/gateway-dev"
+          docker rm "${CONTAINER}"
+          chmod +x "/tmp/gateway-dev"
+
+      - name: Log out from Docker Hub
+        run: docker logout
+
+      - name: Upload gateway binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: gateway-dev-binary
+          path: /tmp/gateway-dev
+          retention-days: 1
+
+  resolve-pinned:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      index_digest: ${{ steps.resolve_pinned.outputs.index_digest }}
+      amd64_digest: ${{ steps.resolve_pinned.outputs.amd64_digest }}
+      arm64_digest: ${{ steps.resolve_pinned.outputs.arm64_digest }}
+    steps:
+      - name: Checkout gwops (to read Dockerfile pin)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Extract pin from Dockerfile
+        id: extract_pin
+        run: |
+          set -euo pipefail
+
+          # Extract GATEWAY_TAG and GATEWAY_DIGEST from Dockerfile ARGs
+          GATEWAY_TAG=$(grep '^ARG GATEWAY_TAG=' Dockerfile | head -1 | sed 's/^ARG GATEWAY_TAG=//')
+          GATEWAY_DIGEST=$(grep '^ARG GATEWAY_DIGEST=' Dockerfile | head -1 | sed 's/^ARG GATEWAY_DIGEST=//')
+
+          if [ -z "$GATEWAY_TAG" ] || [ -z "$GATEWAY_DIGEST" ]; then
+            echo "ERROR: Could not extract GATEWAY_TAG or GATEWAY_DIGEST from Dockerfile" >&2
+            exit 1
+          fi
+
+          # Validate tag format: 2.X.Y or 2.X.Y-dev-<git sha>
+          if ! printf %s "$GATEWAY_TAG" | grep -Ezq '^2\.[0-9]+\.[0-9]+(-dev-[0-9a-f]{7,40})?$'; then
+            echo "ERROR: GATEWAY_TAG must be 2.X.Y or 2.X.Y-dev-<git sha>, got '$GATEWAY_TAG'" >&2
+            exit 1
+          fi
+
+          # Validate digest format: sha256:<64 hex>
+          if ! printf %s "$GATEWAY_DIGEST" | grep -Ezq '^sha256:[0-9a-f]{64}$'; then
+            echo "ERROR: GATEWAY_DIGEST must be sha256:<64 hex>, got '$GATEWAY_DIGEST'" >&2
+            exit 1
+          fi
+
+          echo "gateway_tag=$GATEWAY_TAG" >> "$GITHUB_OUTPUT"
+          echo "gateway_digest=$GATEWAY_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Extracted GATEWAY_TAG: $GATEWAY_TAG"
+          echo "Extracted GATEWAY_DIGEST: $GATEWAY_DIGEST"
+
+      - name: Log in to Docker Hub (if secrets present)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve twingate/gateway pinned digests
+        id: resolve_pinned
+        env:
+          GATEWAY_TAG: ${{ steps.extract_pin.outputs.gateway_tag }}
+          GATEWAY_DIGEST: ${{ steps.extract_pin.outputs.gateway_digest }}
+        run: |
+          set -euo pipefail
+
+          # Inspect the pinned digest once (immutable ref, not the tag which can move)
+          INDEX_JSON=$(docker buildx imagetools inspect "twingate/gateway@$GATEWAY_DIGEST" --format '{{json .Manifest}}')
+
+          # Verify the inspected digest equals the Dockerfile pin (tag→digest equality assertion)
+          INSPECTED_DIGEST=$(echo "$INDEX_JSON" | jq -er '.digest')
+          if [ "$INSPECTED_DIGEST" != "$GATEWAY_DIGEST" ]; then
+            echo "ERROR: inspected digest $INSPECTED_DIGEST != pinned digest $GATEWAY_DIGEST" >&2
+            exit 1
+          fi
+
+          # Extract platform manifests from the same inspection result
+          AMD64_DIGEST=$(echo "$INDEX_JSON" | jq -er '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest')
+          if [ -z "$AMD64_DIGEST" ]; then
+            echo "ERROR: no linux/amd64 manifest found in $GATEWAY_TAG@$GATEWAY_DIGEST" >&2
+            exit 1
+          fi
+
+          # arm64 is optional (build-images builds amd64 only); log if present
+          ARM64_DIGEST=$(echo "$INDEX_JSON" | jq -er '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' 2>/dev/null || echo "")
+
+          # Validate amd64 digest format
+          if ! printf %s "$AMD64_DIGEST" | grep -Ezq '^sha256:[0-9a-f]{64}$'; then
+            echo "ERROR: AMD64_DIGEST $AMD64_DIGEST does not match sha256:<64 hex>" >&2
+            exit 1
+          fi
+
+          echo "index_digest=$INSPECTED_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "amd64_digest=$AMD64_DIGEST" >> "$GITHUB_OUTPUT"
+          [ -n "$ARM64_DIGEST" ] && echo "arm64_digest=$ARM64_DIGEST" >> "$GITHUB_OUTPUT"
+
+          echo "twingate/gateway:$GATEWAY_TAG (pinned) index:       $INSPECTED_DIGEST"
+          echo "twingate/gateway:$GATEWAY_TAG (pinned) linux/amd64: $AMD64_DIGEST"
+          [ -n "$ARM64_DIGEST" ] && echo "twingate/gateway:$GATEWAY_TAG (pinned) linux/arm64: $ARM64_DIGEST"
+
+          {
+            echo "## Gateway pinned (\`$GATEWAY_TAG\`) tested"
+            echo ""
+            echo "- Index digest: \`$INSPECTED_DIGEST\`"
+            echo "- linux/amd64 manifest: \`$AMD64_DIGEST\`"
+            [ -n "$ARM64_DIGEST" ] && echo "- linux/arm64 manifest: \`$ARM64_DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pull gateway pinned binary
+        env:
+          AMD64_DIGEST: ${{ steps.resolve_pinned.outputs.amd64_digest }}
+        run: |
+          set -euo pipefail
+          docker pull "twingate/gateway@$AMD64_DIGEST"
+
+      - name: Extract gateway pinned binary
+        env:
+          AMD64_DIGEST: ${{ steps.resolve_pinned.outputs.amd64_digest }}
+        run: |
+          set -euo pipefail
+          CONTAINER=$(docker create "twingate/gateway@$AMD64_DIGEST")
+          docker cp "${CONTAINER}:/gateway" "/tmp/gateway-pinned"
+          docker rm "${CONTAINER}"
+          chmod +x "/tmp/gateway-pinned"
+
+      - name: Log out from Docker Hub
+        run: docker logout
+
+      - name: Upload gateway binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: gateway-pinned-binary
+          path: /tmp/gateway-pinned
+          retention-days: 1
+
+  preflight:
+    runs-on: ubuntu-latest
+    needs: resolve
+    timeout-minutes: 10
+    steps:
+      - name: Checkout gwops (control plane + golden fixtures)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install gwops
+        run: |
+          pip install --require-hashes -r requirements.lock
+          pip install --no-deps --no-build-isolation -e .
+
+      - name: Download gateway binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: gateway-dev-binary
+          path: /tmp
+
+      - name: Set up canary non-PEM file
+        run: |
+          echo "This is not a valid PEM certificate file." > /tmp/gwops-ci-bad-ca-bundle.txt
+
+      - name: Preflight golden - minimal (credential files absent, expected startup failure)
+        env:
+          GATEWAY_BIN: /tmp/gateway-dev
+          CONFIGS: tests/fixtures/rendered/minimal.yaml
+        run: |
+          chmod +x "$GATEWAY_BIN"
+          make preflight-ci GATEWAY_BIN="$GATEWAY_BIN" CONFIGS="$CONFIGS"
+
+      # The gateway checks headers before CA bundles, so a missing-bundle error means headers passed.
+      - name: Preflight golden - webapp (headers accepted, bundle absent)
+        env:
+          GATEWAY_BIN: /tmp/gateway-dev
+        run: |
+          chmod +x "$GATEWAY_BIN"
+          python -m gwops.ci.preflight \
+            --expect-failure "failed to create web app config" \
+            --expect-failure "/data/upstream-ca/" \
+            --expect-failure "no such file or directory" \
+            "$GATEWAY_BIN" tests/fixtures/rendered/webapp.yaml
+
+      - name: Preflight canary - bad CA bundle
+        env:
+          GATEWAY_BIN: /tmp/gateway-dev
+        run: |
+          chmod +x "$GATEWAY_BIN"
+          python -m gwops.ci.preflight \
+            --expect-failure "failed to create web app config" \
+            --expect-failure "failed to parse CA certificate" \
+            --expect-failure "/tmp/gwops-ci-bad-ca-bundle.txt" \
+            "$GATEWAY_BIN" tests/fixtures/rendered/canary-bad-ca-bundle.yaml
+
+      - name: Preflight canary - bad template key
+        env:
+          GATEWAY_BIN: /tmp/gateway-dev
+        run: |
+          chmod +x "$GATEWAY_BIN"
+          python -m gwops.ci.preflight \
+            --expect-failure "failed to create web app config" \
+            --expect-failure "unsupported key" \
+            "$GATEWAY_BIN" tests/fixtures/rendered/canary-bad-template.yaml
+
+      # Last (before public): it creates /data/pki, which would change the minimal golden's expected failure.
+      - name: Preflight golden - on-demand TLS issuance (boots with throwaway PKI)
+        env:
+          GATEWAY_BIN: /tmp/gateway-dev
+        run: |
+          chmod +x "$GATEWAY_BIN"
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /data/pki
+          python tests/fixtures/rendered/on_demand_pki.py /data/pki
+          python -m gwops.ci.preflight "$GATEWAY_BIN" tests/fixtures/rendered/tls-on-demand.yaml
+
+      # Last: public-certificate mode with operator-supplied static certificates
+      - name: Preflight golden - public TLS mode (static certificates)
+        env:
+          GATEWAY_BIN: /tmp/gateway-dev
+        run: |
+          chmod +x "$GATEWAY_BIN"
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /data/pki /data/public-tls
+          python tests/fixtures/rendered/public_tls_pki.py /data
+          python -m gwops.ci.preflight "$GATEWAY_BIN" tests/fixtures/rendered/public-tls.yaml
+
+  preflight-pinned:
+    runs-on: ubuntu-latest
+    needs: resolve-pinned
+    timeout-minutes: 10
+    steps:
+      - name: Checkout gwops (control plane + golden fixtures)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install gwops
+        run: |
+          pip install --require-hashes -r requirements.lock
+          pip install --no-deps --no-build-isolation -e .
+
+      - name: Download gateway binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: gateway-pinned-binary
+          path: /tmp
+
+      - name: Set up canary non-PEM file
+        run: |
+          echo "This is not a valid PEM certificate file." > /tmp/gwops-ci-bad-ca-bundle.txt
+
+      - name: Preflight golden - minimal (credential files absent, expected startup failure)
+        env:
+          GATEWAY_BIN: /tmp/gateway-pinned
+          CONFIGS: tests/fixtures/rendered/minimal.yaml
+        run: |
+          chmod +x "$GATEWAY_BIN"
+          make preflight-ci GATEWAY_BIN="$GATEWAY_BIN" CONFIGS="$CONFIGS"
+
+      # The gateway checks headers before CA bundles, so a missing-bundle error means headers passed.
+      - name: Preflight golden - webapp (headers accepted, bundle absent)
+        env:
+          GATEWAY_BIN: /tmp/gateway-pinned
+        run: |
+          chmod +x "$GATEWAY_BIN"
+          python -m gwops.ci.preflight \
+            --expect-failure "failed to create web app config" \
+            --expect-failure "/data/upstream-ca/" \
+            --expect-failure "no such file or directory" \
+            "$GATEWAY_BIN" tests/fixtures/rendered/webapp.yaml
+
+      - name: Preflight canary - bad CA bundle
+        env:
+          GATEWAY_BIN: /tmp/gateway-pinned
+        run: |
+          chmod +x "$GATEWAY_BIN"
+          python -m gwops.ci.preflight \
+            --expect-failure "failed to create web app config" \
+            --expect-failure "failed to parse CA certificate" \
+            --expect-failure "/tmp/gwops-ci-bad-ca-bundle.txt" \
+            "$GATEWAY_BIN" tests/fixtures/rendered/canary-bad-ca-bundle.yaml
+
+      - name: Preflight canary - bad template key
+        env:
+          GATEWAY_BIN: /tmp/gateway-pinned
+        run: |
+          chmod +x "$GATEWAY_BIN"
+          python -m gwops.ci.preflight \
+            --expect-failure "failed to create web app config" \
+            --expect-failure "unsupported key" \
+            "$GATEWAY_BIN" tests/fixtures/rendered/canary-bad-template.yaml
+
+      # Last (before public): it creates /data/pki, which would change the minimal golden's expected failure.
+      - name: Preflight golden - on-demand TLS issuance (boots with throwaway PKI)
+        env:
+          GATEWAY_BIN: /tmp/gateway-pinned
+        run: |
+          chmod +x "$GATEWAY_BIN"
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /data/pki
+          python tests/fixtures/rendered/on_demand_pki.py /data/pki
+          python -m gwops.ci.preflight "$GATEWAY_BIN" tests/fixtures/rendered/tls-on-demand.yaml
+
+      # Last: public-certificate mode with operator-supplied static certificates
+      - name: Preflight golden - public TLS mode (static certificates)
+        env:
+          GATEWAY_BIN: /tmp/gateway-pinned
+        run: |
+          chmod +x "$GATEWAY_BIN"
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /data/pki /data/public-tls
+          python tests/fixtures/rendered/public_tls_pki.py /data
+          python -m gwops.ci.preflight "$GATEWAY_BIN" tests/fixtures/rendered/public-tls.yaml

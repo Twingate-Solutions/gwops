@@ -1,0 +1,41 @@
+# Golden fixture: render_gateway_config with web apps, gateway-wide headers including
+# a trusted name, and one CA bundle. Seed: one web app at grafana.example:3000,
+# one upstream-trusted CA bundle at /config/webapp-cas/example-root.pem (content-addressed
+# copy at /data/upstream-ca/example-root-abcdef123456.pem), and one gateway-wide header
+# "X-Trusted-User" with template {{username}} (renders every -/_ spelling: three variants
+# besides the original). The preflight against a real binary must reach proxy creation
+# (expected: missing CA bundle file under /data/upstream-ca/).
+twingate:
+  network: acme
+  host: twingate.com
+port: 8443
+metricsPort: 9090
+tls:
+  certificates:
+    files:
+      - certificateFile: /data/pki/leaf/fullchain.pem
+        privateKeyFile: /data/pki/leaf/privkey.pem
+log:
+  sessionRecording:
+    segment:
+      maxSize: 256000
+ssh:
+  gateway:
+    username: gateway
+    key:
+      type: ed25519
+    hostCertificate:
+      ttl: 24h
+    userCertificate:
+      ttl: 5m
+  ca:
+    local:
+      privateKeyFile: /data/pki/ssh-ca.key
+webApp:
+  requestHeaders:
+    X-Trusted-User: '{{username}}'
+    X-Trusted_User: '{{username}}'
+    X_Trusted-User: '{{username}}'
+    X_Trusted_User: '{{username}}'
+upstreamTrustedCABundles:
+  - file: /data/upstream-ca/example-root-abcdef123456.pem

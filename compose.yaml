@@ -1,0 +1,106 @@
+# compose.yaml — drop-in deployment of the gwops gateway.
+#
+# Pulls the prebuilt image from GHCR (no local build) and self-launches a basic
+# gateway for your Twingate tenant + upstreams. To run:
+#   1. cp .env.example .env          # add TWINGATE_API_KEY + GWOPS_ADMIN_TOKEN
+#   2. cp seed.example.yaml seed.yaml && $EDITOR seed.yaml   # tenant, gateway mode, upstreams
+#   3. docker compose up -d          # .env is auto-loaded from this directory
+#
+# Gateway object (seed `twingate`), one of two modes:
+#   - remote-network mode: name an existing Remote Network plus a connector-reachable
+#     gateway_address; gwops adopts a Gateway already at that address or creates one,
+#   - pinned-gateway mode: gateway_id of an existing Gateway object; gwops uses it as-is.
+# Either way the Remote Network needs a healthy Connector (gwops does not create Remote
+# Networks or Connectors). The API key needs permission to manage Resources, Certificate
+# Authorities and, in remote-network mode, Gateways.
+#
+# Capabilities:
+#   - SSH upstreams and exactly ONE Kubernetes cluster (the gateway has no match-based multi-upstream),
+#   - web apps: the gateway as an L7 reverse proxy for internal HTTP(S) apps (seed `web_apps`),
+#   - public certificates (seed `public_tls`), supplied as files or issued by ACME,
+#   - optional session recording via the gwops spool and shipper (to an HTTP receiver you run),
+#   - config changes apply on gateway drain-restart; certificate renewals hot-reload.
+#
+# Ports: 8443 gateway listener, 9090 gateway /metrics only, 8081 gwops admin API.
+
+services:
+  gateway:
+    image: ghcr.io/twingate-solutions/gwops:latest
+    # Pulled only when missing locally. If the GHCR package is private, run
+    # `docker login ghcr.io` first. To update: `docker pull <the image above>`, then re-run `up`.
+    # Pin a :<commit-sha> or version tag instead of :latest for a reproducible deploy.
+    pull_policy: missing
+    container_name: gwops-gateway
+    restart: unless-stopped
+    # gwops drains the gateway for up to 30 s on stop; Docker's default grace period is 10 s.
+    stop_grace_period: 40s
+    # Name resolution: the gateway dials every upstream host name in seed.yaml (SSH hosts, the
+    # Kubernetes API server, web-app addresses and aliases) itself, through this container's
+    # resolver. gwops does not manage /etc/hosts. Pin any name the container's DNS cannot
+    # resolve (LAN-only or split-horizon names) here. A name added later through the admin
+    # API needs a new entry and `docker compose up -d`. IP-literal addresses need nothing.
+    # Check with: docker compose exec gateway getent hosts <name>
+    # extra_hosts:
+    #   - "db1.internal.example.com:10.0.10.5"
+    #   - "grafana.apps.example.com:10.0.0.11"
+    # Runtime hardening: the image runs as non-root (uid 10001); these block privilege
+    # escalation and Linux capabilities and make the root filesystem read-only. Only /data
+    # and the two tmpfs mounts are writable. The gateway binds 8443/9090, so no capability
+    # is needed to listen.
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      # mode=1777 so the non-root uid 10001 can write (a bare tmpfs mounts root-owned).
+      - /run/gateway:mode=1777   # rendered gateway config + runtime scratch
+      - /tmp:mode=1777
+    environment:
+      # Secrets — env only (loaded from ./.env). Fail loud at `up` if unset.
+      TWINGATE_API_KEY: ${TWINGATE_API_KEY:?set TWINGATE_API_KEY in .env}
+      GWOPS_ADMIN_TOKEN: ${GWOPS_ADMIN_TOKEN:?set GWOPS_ADMIN_TOKEN in .env}
+      # Only needed if you turn recording on in seed.yaml — then also uncomment
+      # GWOPS_RECORDING_TOKEN in .env:
+      # GWOPS_RECORDING_TOKEN: ${GWOPS_RECORDING_TOKEN:-}
+      # Only needed for an unattended caller (a webhook) to manage upstreams through the
+      # admin API; also requires twingate.access_allowlist and twingate.address_allowlist in
+      # seed.yaml, and must differ from GWOPS_ADMIN_TOKEN. Add it to .env too:
+      # GWOPS_AUTOMATION_TOKEN: ${GWOPS_AUTOMATION_TOKEN:-}
+      # Outbound proxy. gwops and its healthcheck use httpx, which honours these variables
+      # (the gateway binary inherits them too). The healthcheck dials the admin API on
+      # loopback, so loopback must stay in NO_PROXY or the container turns unhealthy behind
+      # a proxy. httpx ignores CIDR entries in NO_PROXY: list exact hosts and domains.
+      # HTTPS_PROXY: ${HTTPS_PROXY:-}
+      # HTTP_PROXY: ${HTTP_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost}
+    volumes:
+      - ./seed.yaml:/config/seed.yaml:ro  # your declarative config (read-only; never written back)
+      - gwdata:/data                       # persistent: generated CAs, overlays, ownership registry, spool
+      # For a Kubernetes upstream, also mount your token + CA under /config/k8s-creds
+      # (the only place gwops reads them from) so seed.yaml can reference them (see
+      # seed.yaml), e.g.:
+      # - ./k8s-creds:/config/k8s-creds:ro
+      # For web apps with a private upstream CA, mount the PEM bundles under
+      # /config/webapp-cas (see seed.example.yaml, web_app_proxy), e.g.:
+      # - ./webapp-cas:/config/webapp-cas:ro
+      # For public certificates you supply as files (public_tls certificates with
+      # source: file), mount the directory holding one subdirectory per certificate
+      # (<name>/fullchain.pem, <name>/privkey.pem) under /config/public-tls, readable by
+      # uid 10001, e.g.:
+      # - ./public-tls:/config/public-tls:ro
+      # For ACME-issued public certificates, mount the directory holding your Cloudflare
+      # API token file (default name: cloudflare-token) under /config/acme. Only needed
+      # when public_tls.acme is configured in seed.yaml. gwops never reads the token; the
+      # ACME client reads it itself via CF_DNS_API_TOKEN_FILE. ACME account and issued
+      # certificates live under /data/acme on the gwdata volume above (no extra mount), e.g.:
+      # - ./acme:/config/acme:ro
+    ports:
+      - "8443:8443"              # gateway listener — MUST be reachable by your Twingate Connector
+      - "127.0.0.1:9090:9090"    # gateway /metrics — host loopback only
+      - "127.0.0.1:8081:8081"    # gwops admin API — host loopback only (bearer-token protected)
+    # HEALTHCHECK (python -m gwops.healthcheck) is baked into the image; `docker
+    # compose ps` shows healthy once the process is up and the first reconcile is ok.
+
+volumes:
+  gwdata:

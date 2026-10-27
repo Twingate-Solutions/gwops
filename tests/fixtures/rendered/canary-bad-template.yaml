@@ -1,0 +1,33 @@
+# Canary fixture: unsupported template key in request headers. Headers are validated
+# before bundles, so this canary must not include bundles to isolate the error.
+# Expected gateway error: "failed to create proxy failed to create web app config: header ...
+# unsupported key ..."
+twingate:
+  network: acme
+  host: twingate.com
+port: 8443
+metricsPort: 9090
+tls:
+  certificates:
+    files:
+      - certificateFile: /data/pki/leaf/fullchain.pem
+        privateKeyFile: /data/pki/leaf/privkey.pem
+log:
+  sessionRecording:
+    segment:
+      maxSize: 256000
+ssh:
+  gateway:
+    username: gateway
+    key:
+      type: ed25519
+    hostCertificate:
+      ttl: 24h
+    userCertificate:
+      ttl: 5m
+  ca:
+    local:
+      privateKeyFile: /data/pki/ssh-ca.key
+webApp:
+  requestHeaders:
+    X-Invalid-Key: 'prefix {{unsupported_key}} suffix'

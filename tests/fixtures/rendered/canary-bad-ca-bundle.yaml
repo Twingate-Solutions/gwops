@@ -1,0 +1,33 @@
+# Canary fixture: invalid CA bundle (non-PEM file). The bundle path exists in the
+# CI container but contains non-PEM data. Must include webApp: {} so the gateway reads
+# the bundle, and must not include kubernetes (to isolate the bundle error).
+# Expected gateway error: "failed to create proxy failed to create web app config: ca ..."
+twingate:
+  network: acme
+  host: twingate.com
+port: 8443
+metricsPort: 9090
+tls:
+  certificates:
+    files:
+      - certificateFile: /data/pki/leaf/fullchain.pem
+        privateKeyFile: /data/pki/leaf/privkey.pem
+log:
+  sessionRecording:
+    segment:
+      maxSize: 256000
+ssh:
+  gateway:
+    username: gateway
+    key:
+      type: ed25519
+    hostCertificate:
+      ttl: 24h
+    userCertificate:
+      ttl: 5m
+  ca:
+    local:
+      privateKeyFile: /data/pki/ssh-ca.key
+webApp: {}
+upstreamTrustedCABundles:
+  - file: /tmp/gwops-ci-bad-ca-bundle.txt

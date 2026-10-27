@@ -1,0 +1,168 @@
+name: build-images
+
+# Builds the gwops gateway image and pushes it to GHCR so it can be pulled for testing.
+# The image wraps the official twingate/gateway:`gateway_tag`@`gateway_digest` binary;
+# the gwops control plane is baked on top.
+#
+# After a run, pull it (exact tags are in the run's job summary):
+#   docker pull ghcr.io/<owner>/<repo>:<commit-sha>   # reproducible
+#   docker pull ghcr.io/<owner>/<repo>:latest         # only when run with tag_latest
+#
+# ── One-time setup ──
+#   1. If the official `twingate/gateway` image is private on Docker Hub, add
+#      DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets and uncomment the login step.
+#   2. Under Settings → Actions → General, allow "Read and write permissions" (or the
+#      packages: write permission below is enough on most orgs) so GHCR pushes work.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      gateway_tag:
+        # The wrapped gateway binary: 2.X.Y or 2.X.Y-dev-<git sha>, never `latest` or a
+        # floating tag. The Dockerfile rejects anything else. Independent of this image's
+        # own :latest tag. Keep equal to the Dockerfile pin.
+        description: "twingate/gateway image tag to wrap"
+        default: "2.0.0"
+        type: string
+      gateway_digest:
+        # Image-index digest of gateway_tag; preview tags are re-pushable, so the digest
+        # fixes the bytes.
+        description: "twingate/gateway image-index digest (sha256:<64 hex>)"
+        default: "sha256:4993a7db015f7c2091d55f1c7a36c3e0c277137cb9937a46e9ced2c17456a6d1"
+        type: string
+      tag_latest:
+        # Publishing :latest moves what `compose.yaml` pulls, so it is opt-in.
+        description: "Also tag the image :latest"
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gwops (Dockerfile + control-plane build context)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # If twingate/gateway is private on Docker Hub, add the secrets (setup step 1) and
+      # uncomment — the build pulls that image as its binary source.
+      # - name: Log in to Docker Hub
+      #   uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+      #   with:
+      #     username: ${{ secrets.DOCKERHUB_USERNAME }}
+      #     password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve image name (GHCR requires lowercase)
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve GWOPS_VERSION
+        id: version
+        env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          SHORT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # If this is a tag push, use the tag with leading 'v' stripped
+          if [[ "$REF" == refs/tags/* ]]; then
+            VERSION="${REF_NAME#v}"  # Remove leading 'v' if present
+          else
+            # Non-tag build: 0.0.0-dev.<7-char short SHA>
+            VERSION="0.0.0-dev.${SHORT_SHA:0:7}"
+          fi
+
+          # Validate against regex: ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$
+          if ! printf %s "$VERSION" | grep -Ezq '^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$'; then
+            echo "ERROR: GWOPS_VERSION must match ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}\$, got '$VERSION'" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Validate gateway tag and digest
+        env:
+          GATEWAY_TAG: ${{ inputs.gateway_tag || '2.0.0' }}
+          GATEWAY_DIGEST: ${{ inputs.gateway_digest || 'sha256:4993a7db015f7c2091d55f1c7a36c3e0c277137cb9937a46e9ced2c17456a6d1' }}
+        run: |
+          set -euo pipefail
+
+          # Validate tag format: 2.X.Y or 2.X.Y-dev-<git sha>
+          if ! printf %s "$GATEWAY_TAG" | grep -Ezq '^2\.[0-9]+\.[0-9]+(-dev-[0-9a-f]{7,40})?$'; then
+            echo "ERROR: GATEWAY_TAG must be 2.X.Y or 2.X.Y-dev-<git sha>, got '$GATEWAY_TAG'" >&2
+            exit 1
+          fi
+
+          # Validate digest format: sha256:<64 hex>
+          if ! printf %s "$GATEWAY_DIGEST" | grep -Ezq '^sha256:[0-9a-f]{64}$'; then
+            echo "ERROR: GATEWAY_DIGEST must be sha256:<64 hex>, got '$GATEWAY_DIGEST'" >&2
+            exit 1
+          fi
+
+          # Verify the tag resolves to the digest
+          RESOLVED_DIGEST=$(docker buildx imagetools inspect "twingate/gateway:$GATEWAY_TAG" --format '{{json .Manifest}}' | jq -er '.digest')
+          if [ "$RESOLVED_DIGEST" != "$GATEWAY_DIGEST" ]; then
+            echo "ERROR: tag 'twingate/gateway:$GATEWAY_TAG' resolves to $RESOLVED_DIGEST, not $GATEWAY_DIGEST" >&2
+            exit 1
+          fi
+
+      - name: Build and push
+        env:
+          GATEWAY_TAG: ${{ inputs.gateway_tag || '2.0.0' }}
+          GATEWAY_DIGEST: ${{ inputs.gateway_digest || 'sha256:4993a7db015f7c2091d55f1c7a36c3e0c277137cb9937a46e9ced2c17456a6d1' }}
+          TAG_LATEST: ${{ inputs.tag_latest || 'false' }}
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64 # amd64 only; add linux/arm64 and a QEMU step for multi-arch
+          provenance: false
+          build-args: |
+            GATEWAY_TAG=${{ env.GATEWAY_TAG }}
+            GATEWAY_DIGEST=${{ env.GATEWAY_DIGEST }}
+            GWOPS_VERSION=${{ steps.version.outputs.version }}
+          tags: |
+            ${{ steps.img.outputs.name }}:${{ github.sha }}
+            ${{ github.ref_type == 'tag' && format('{0}:{1}', steps.img.outputs.name, steps.version.outputs.version) || '' }}
+            ${{ env.TAG_LATEST == 'true' && format('{0}:latest', steps.img.outputs.name) || '' }}
+
+      - name: Job summary
+        env:
+          GATEWAY_TAG: ${{ inputs.gateway_tag || '2.0.0' }}
+          TAG_LATEST: ${{ inputs.tag_latest || 'false' }}
+          GWOPS_VERSION: ${{ steps.version.outputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          {
+            echo "### gwops image pushed (gateway $GATEWAY_TAG, gwops $GWOPS_VERSION)"
+            echo ""
+            echo '```'
+            echo "docker pull ${{ steps.img.outputs.name }}:${{ github.sha }}"
+            if [ "$REF_TYPE" = "tag" ]; then
+              echo "docker pull ${{ steps.img.outputs.name }}:$GWOPS_VERSION"
+            fi
+            if [ "$TAG_LATEST" = "true" ]; then
+              echo "docker pull ${{ steps.img.outputs.name }}:latest"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

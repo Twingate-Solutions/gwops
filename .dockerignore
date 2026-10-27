@@ -1,0 +1,33 @@
+# The build context only needs pyproject.toml, README.md, requirements.lock, and src/ (see Dockerfile).
+# Keep everything else out so edits to tests/docs/tooling don't bust the build cache.
+
+.git
+.gitignore
+.gitattributes
+
+# Local-only / untracked
+.claude
+.superpowers
+CLAUDE.md
+docs
+archive
+
+# Tests and their fakes are never installed into the image
+tests
+
+# Python caches and virtualenv
+.venv
+__pycache__
+*.pyc
+*.pyo
+.mypy_cache
+.pytest_cache
+.ruff_cache
+*.egg-info
+build
+dist
+
+# The Dockerfile and its ignore file are not part of the installed project
+Dockerfile
+.dockerignore
+Makefile

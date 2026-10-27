@@ -1,0 +1,38 @@
+# Golden fixture: render_gateway_config(no-upstream state with ca.x509.on_demand_issuance: true,
+# Capabilities(gateway_version="2.0.0"), RuntimePaths.from_settings(GwopsSettings())).
+# Identical to minimal.yaml's base plus tls.automation.issuer.local pointing at the gwops
+# X.509 CA files; the gwops leaf stays the only entry under tls.certificates.files. No
+# tls.automation.certificate block is rendered (the gateway defaults apply). Compared
+# structurally (parsed YAML) by tests/renderer/test_tls_on_demand.py.
+# CI preflight writes throwaway PKI to /data/pki (on_demand_pki.py) and expects a healthy boot.
+twingate:
+  network: acme2
+  host: twingate.com
+port: 8443
+metricsPort: 9090
+tls:
+  certificates:
+    files:
+      - certificateFile: /data/pki/leaf/fullchain.pem
+        privateKeyFile: /data/pki/leaf/privkey.pem
+  automation:
+    issuer:
+      local:
+        certificateFile: /data/pki/x509-ca.crt
+        privateKeyFile: /data/pki/x509-ca.key
+log:
+  sessionRecording:
+    segment:
+      maxSize: 256000
+ssh:
+  gateway:
+    username: gateway
+    key:
+      type: ed25519
+    hostCertificate:
+      ttl: 24h
+    userCertificate:
+      ttl: 5m
+  ca:
+    local:
+      privateKeyFile: /data/pki/ssh-ca.key

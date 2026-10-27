@@ -1,0 +1,218 @@
+{
+  "data": {
+    "resources": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "YXJyYXljb25uZWN0aW9uOjc="
+      },
+      "edges": [
+        {
+          "node": {
+            "__typename": "WebAppResource",
+            "id": "UmVzb3VyY2U6Mzc1Mzg2Mg==",
+            "name": "lt-minimal",
+            "address": {
+              "value": "lt-minimal.gwtest.internal"
+            },
+            "gateway": {
+              "id": "R2F0ZXdheToxMjYx"
+            },
+            "upstream": {
+              "port": 8080,
+              "tlsMode": "NONE"
+            },
+            "downstream": {
+              "port": 80,
+              "tlsMode": "NONE"
+            },
+            "requestHeaderRewrites": []
+          }
+        },
+        {
+          "node": {
+            "__typename": "WebAppResource",
+            "id": "UmVzb3VyY2U6Mzc1Mzg2Mw==",
+            "name": "lt-full",
+            "address": {
+              "value": "lt-full.gwtest.internal"
+            },
+            "gateway": {
+              "id": "R2F0ZXdheToxMjYx"
+            },
+            "upstream": {
+              "port": 8443,
+              "tlsMode": "VERIFY_CA"
+            },
+            "downstream": {
+              "port": 443,
+              "tlsMode": "TLS13"
+            },
+            "requestHeaderRewrites": []
+          }
+        },
+        {
+          "node": {
+            "__typename": "WebAppResource",
+            "id": "UmVzb3VyY2U6Mzc1Mzg2NA==",
+            "name": "lt-badkey",
+            "address": {
+              "value": "lt-badkey.gwtest.internal"
+            },
+            "gateway": {
+              "id": "R2F0ZXdheToxMjYx"
+            },
+            "upstream": {
+              "port": 80,
+              "tlsMode": "NONE"
+            },
+            "downstream": {
+              "port": 80,
+              "tlsMode": "NONE"
+            },
+            "requestHeaderRewrites": [
+              {
+                "key": "X-Bad",
+                "value": "{{nope}}"
+              }
+            ]
+          }
+        },
+        {
+          "node": {
+            "__typename": "WebAppResource",
+            "id": "UmVzb3VyY2U6Mzc1Mzg2NQ==",
+            "name": "lt-twokeys",
+            "address": {
+              "value": "lt-twokeys.gwtest.internal"
+            },
+            "gateway": {
+              "id": "R2F0ZXdheToxMjYx"
+            },
+            "upstream": {
+              "port": 80,
+              "tlsMode": "NONE"
+            },
+            "downstream": {
+              "port": 80,
+              "tlsMode": "NONE"
+            },
+            "requestHeaderRewrites": [
+              {
+                "key": "X-Two",
+                "value": "{{username}}-{{groups}}"
+              }
+            ]
+          }
+        },
+        {
+          "node": {
+            "__typename": "WebAppResource",
+            "id": "UmVzb3VyY2U6Mzc1Mzg2Ng==",
+            "name": "lt-badname",
+            "address": {
+              "value": "lt-badname.gwtest.internal"
+            },
+            "gateway": {
+              "id": "R2F0ZXdheToxMjYx"
+            },
+            "upstream": {
+              "port": 80,
+              "tlsMode": "NONE"
+            },
+            "downstream": {
+              "port": 80,
+              "tlsMode": "NONE"
+            },
+            "requestHeaderRewrites": [
+              {
+                "key": "Bad Header",
+                "value": "x"
+              }
+            ]
+          }
+        },
+        {
+          "node": {
+            "__typename": "WebAppResource",
+            "id": "UmVzb3VyY2U6Mzc1Mzg2Nw==",
+            "name": "lt-crlf",
+            "address": {
+              "value": "lt-crlf.gwtest.internal"
+            },
+            "gateway": {
+              "id": "R2F0ZXdheToxMjYx"
+            },
+            "upstream": {
+              "port": 80,
+              "tlsMode": "NONE"
+            },
+            "downstream": {
+              "port": 80,
+              "tlsMode": "NONE"
+            },
+            "requestHeaderRewrites": [
+              {
+                "key": "X-Crlf",
+                "value": "a\r\nInjected: b"
+              }
+            ]
+          }
+        },
+        {
+          "node": {
+            "__typename": "WebAppResource",
+            "id": "UmVzb3VyY2U6Mzc1Mzg2OA==",
+            "name": "lt-host",
+            "address": {
+              "value": "lt-host.gwtest.internal"
+            },
+            "gateway": {
+              "id": "R2F0ZXdheToxMjYx"
+            },
+            "upstream": {
+              "port": 80,
+              "tlsMode": "NONE"
+            },
+            "downstream": {
+              "port": 80,
+              "tlsMode": "NONE"
+            },
+            "requestHeaderRewrites": [
+              {
+                "key": "Host",
+                "value": "other.internal"
+              }
+            ]
+          }
+        },
+        {
+          "node": {
+            "__typename": "WebAppResource",
+            "id": "UmVzb3VyY2U6Mzc1Mzg2OQ==",
+            "name": "lt-underscore",
+            "address": {
+              "value": "lt-underscore.gwtest.internal"
+            },
+            "gateway": {
+              "id": "R2F0ZXdheToxMjYx"
+            },
+            "upstream": {
+              "port": 80,
+              "tlsMode": "NONE"
+            },
+            "downstream": {
+              "port": 80,
+              "tlsMode": "NONE"
+            },
+            "requestHeaderRewrites": [
+              {
+                "key": "X_Twingate_User",
+                "value": "{{username}}"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,52 @@
+[
+  {
+    "data": {
+      "certificateAuthorities": {
+        "pageInfo": {
+          "hasNextPage": true,
+          "endCursor": "Y3Vyc29yOjI="
+        },
+        "edges": [
+          {
+            "node": {
+              "__typename": "SSHCertificateAuthority"
+            }
+          },
+          {
+            "node": {
+              "__typename": "X509CertificateAuthority",
+              "id": "WDUwOUNBOjQz",
+              "name": "gwops-x509-docker-host",
+              "fingerprint": "AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB"
+            }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "data": {
+      "certificateAuthorities": {
+        "pageInfo": {
+          "hasNextPage": false,
+          "endCursor": "Y3Vyc29yOjQ="
+        },
+        "edges": [
+          {
+            "node": {
+              "__typename": "X509CertificateAuthority",
+              "id": "WDUwOUNBOjQy",
+              "name": "gwops-docker-host-isrg_root_x1",
+              "fingerprint": "96:BC:EC:06:26:49:76:F3:74:60:77:9A:CF:28:C5:A7:CF:E8:A3:C0:AA:E1:1A:8F:FC:EE:05:C0:BD:DF:08:C6"
+            }
+          },
+          {
+            "node": {
+              "__typename": "SSHCertificateAuthority"
+            }
+          }
+        ]
+      }
+    }
+  }
+]

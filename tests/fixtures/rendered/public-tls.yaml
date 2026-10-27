@@ -1,0 +1,38 @@
+# Golden fixture: render_gateway_config(public-mode state, Capabilities(gateway_version="2.0.0"),
+# RuntimePaths.from_settings(GwopsSettings())). Seed: public_tls with zone example.com and two
+# static certificates (app-wildcard, ssh-bastion); one SSH upstream and one web app
+# (upstream_tls: verify_full, no CA bundles). One tls.certificates.files entry per certificate,
+# sorted by name, at the stable store paths /data/public-tls/<name>/{fullchain,privkey}.pem; no
+# tls.automation, and the gwops leaf is not rendered. Compared structurally (parsed YAML) by
+# tests/renderer/test_render_public_golden.py.
+# CI preflight writes throwaway material to /data/public-tls (public_tls_pki.py) and expects a
+# healthy boot.
+twingate:
+  network: acme2
+  host: twingate.com
+port: 8443
+metricsPort: 9090
+tls:
+  certificates:
+    files:
+    - certificateFile: /data/public-tls/app-wildcard/fullchain.pem
+      privateKeyFile: /data/public-tls/app-wildcard/privkey.pem
+    - certificateFile: /data/public-tls/ssh-bastion/fullchain.pem
+      privateKeyFile: /data/public-tls/ssh-bastion/privkey.pem
+log:
+  sessionRecording:
+    segment:
+      maxSize: 256000
+ssh:
+  gateway:
+    username: gateway
+    key:
+      type: ed25519
+    hostCertificate:
+      ttl: 24h
+    userCertificate:
+      ttl: 5m
+  ca:
+    local:
+      privateKeyFile: /data/pki/ssh-ca.key
+webApp: {}

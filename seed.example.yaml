@@ -1,0 +1,307 @@
+# seed.example.yaml — declarative seed for the gwops gateway container.
+#
+# Mounted read-only at /config/seed.yaml. gwops NEVER writes this file back;
+# admin-API mutations persist as overlays under /data/overlays/ and are merged
+# on top (maps recurse, named lists merge by `name`, scalars last-wins).
+#
+# Secrets NEVER live here. They come from environment variables only:
+#   TWINGATE_API_KEY        — Twingate GraphQL API key
+#   GWOPS_ADMIN_TOKEN       — bearer token for the gwops admin API
+#   GWOPS_AUTOMATION_TOKEN  — optional limited-scope bearer token for unattended callers
+#                             (see admin_api.automation below)
+#   GWOPS_RECORDING_TOKEN   — bearer token for the recording receiver (recording.enabled: true)
+#
+# Files the seed points at are read only from four confined, read-only mounts:
+#   /config/k8s-creds/   Kubernetes bearer token and CA files (k8s_clusters)
+#   /config/webapp-cas/  web-app CA bundles (web_app_proxy.upstream_ca_bundles)
+#   /config/public-tls/  public-mode certificate and key files (public_tls.certificates, source: file)
+#   /config/acme/        ACME DNS token file (public_tls.acme.token_file). gwops only checks that it
+#                        exists; the ACME client (lego) reads it. Never put the token in the seed.
+# A path that resolves outside its root (symlinks and `..` included) is refused.
+
+# --- Which Twingate tenant and gateway this container serves --------------------
+# Name the gateway one of two ways (exactly one; fail-loud if both or neither):
+#   Remote-network mode — give remote_network (console name) OR remote_network_id,
+#     plus gateway_address (a connector-reachable host:port). On first run gwops
+#     adopts a gateway already at that address, else creates one (recording it under
+#     gateway/self in /data/state.json and reusing it after). Requires
+#     ca.x509.generate: true: gwops registers the X.509 CA it needs to create the
+#     gateway (in public mode, below, it registers the public root instead).
+#   Pinned-gateway mode — pin an existing Gateway object by its GraphQL id
+#     (gateway_id). gwops uses it as-is and rebinds it to the CAs it manages. No
+#     remote_network, remote_network_id or gateway_address may accompany it.
+twingate:
+  network: acme                 # tenant slug from your Admin Console URL: the label
+                                #   before .twingate.com — `acme` from acme.twingate.com,
+                                #   or acme.us1.twingate.com (shard-based)
+  host: twingate.com            # everything AFTER the tenant slug in that URL:
+                                #   twingate.com (legacy) or <shard>.twingate.com,
+                                #   e.g. us1.twingate.com (shard-based). Copy from the
+                                #   console rather than assuming the single-label shape.
+  # Remote-network mode:
+  remote_network: Production DC       # Remote Network name, or:
+  # remote_network_id: UmVtb3RlOjox   # ...its GraphQL id (exactly one of the two)
+  gateway_address: 10.0.0.1:8443      # connector-reachable host:port (port required)
+  # Pinned-gateway mode (comment out the three keys above and use this instead):
+  # gateway_id: R2F0ZXdheTox          # GraphQL ID of an existing Gateway object
+  #
+  # Access defaults (optional, seed-only): groups and security policy assigned to every
+  # resource gwops creates whose own `access` block omits that key. References are
+  # existing Twingate objects by exact name (a plain string) or {id: <GraphQL id>}.
+  # Omit a key here and on the upstream and gwops leaves it alone (no groups, Default
+  # policy on create; never changed afterwards).
+  # resource_defaults:
+  #   groups: ["App Users"]
+  #   security_policy: "Standard Resource Policy"
+  #
+  # Allowlists (optional, seed-only) for every admin-API / overlay write, admin token
+  # included; seed entries and resource_defaults are implicitly allowed. Absent = no
+  # restriction; an empty list = nothing allowed. BOTH are required when
+  # GWOPS_AUTOMATION_TOKEN is set (startup aborts otherwise).
+  # access_allowlist:
+  #   groups: ["App Users"]                 # names or {id: ...}; checked on resolved ids
+  #   security_policies: []
+  # address_allowlist:
+  #   cidrs: ["10.20.0.0/16"]
+  #   dns_suffixes: ["apps.example.com"]    # matches x.apps.example.com, not xapps...
+
+# --- Certificate authorities ----------------------------------------------------
+# Each CA is either generated on first run (generate: true) or brought your own
+# via file paths (generate: false + paths). Generated material persists under
+# /data/pki/.
+ca:
+  x509:
+    generate: true              # set false to bring your own CA:
+    cert_path: null             #   /data/pki/x509-ca.crt   (required if generate: false)
+    key_path: null              #   /data/pki/x509-ca.key   (required if generate: false)
+    # Opt-in (seed-only). true: the gateway also issues a certificate, signed by this CA, for
+    # any name the gwops leaf does not cover (rendered as tls.automation.issuer.local beside
+    # the leaf). SECURITY: a client that presents ANY SNI to :8443 receives such a certificate
+    # BEFORE the access token is authenticated. The client never receives the CA key, but anyone
+    # who can reach :8443 can trigger signing with it. If the CA is in browser trust stores (a
+    # gwops-generated CA serving downstream tls13) or already trusted by devices (a
+    # bring-your-own CA), that certificate is accepted for any name. The CA needs CA:TRUE,
+    # keyCertSign when it has a keyUsage extension, and an unencrypted PEM key, or startup aborts.
+    on_demand_issuance: false
+  ssh:
+    generate: true              # set false to bring your own SSH CA key:
+    key_path: null              #   /data/pki/ssh-ca.key    (required if generate: false)
+
+# --- Public-certificate mode (optional) -------------------------------------------
+# Serves PUBLIC certificates (for example from Let's Encrypt) instead of a gwops-minted leaf.
+# Each certificate is either supplied by you as files (source: file, obtained by any external
+# tool) or issued and renewed by gwops itself with ACME (source: acme, below). gwops registers the public root below as
+# the gateway's X.509 CA, so a Client verifies the served certificates against that root.
+# The presence of `public_tls` turns the mode on. To use it, uncomment the block AND remove
+# the `ca.x509` block above (an explicit `ca.x509` and `public_tls` are mutually exclusive,
+# so `ca` may then hold only `ssh`). Seed-only: never overlay-writable.
+#
+#   zones               every served name must be a DNS name inside one of these (a zone's
+#                       apex counts as inside). Lowercase, two or more labels, no wildcard.
+#   registered_root     isrg_root_x1 is the only accepted value. It is found in the image's
+#                       trust store by SHA-256 fingerprint; a missing root aborts startup.
+#   certificates[]      one entry per certificate:
+#     name              [a-z0-9-]{1,63}, unique
+#     names             the coverage you declare: concrete DNS names or a leftmost `*.` wildcard
+#                       (one label), inside a zone. Each served name (every upstream address and
+#                       web-app alias) must match exactly one certificate's `names`.
+#     source            file (the default when omitted) or acme
+#     cert_file         source: file only. Leaf first, then intermediates, PEM; under /config/public-tls/
+#     key_file          source: file only. One unencrypted EC P-256/P-384 or RSA >= 2048 key, PEM;
+#                       under the same root
+#     challenge_alias   source: acme only, optional (off by default). The zone that
+#                       _acme-challenge.<name> is CNAME-delegated to. lego follows the CNAME and
+#                       writes the TXT record there, so the DNS token needs Zone:Read and DNS:Edit
+#                       on that zone only, not on the certificate's zone. Use a dedicated zone
+#                       that holds nothing else: a leaked token can then edit only that zone. You
+#                       create the CNAME; gwops passes nothing extra to lego. Recommended for
+#                       production.
+#   acme                required when any certificate has source: acme. Seed-only:
+#     email             ACME account contact. A changed value registers a new account.
+#     accept_tos        must be true: you accept the certificate authority's terms of service.
+#     directory         staging (the default), production, or an https:// ACME directory URL.
+#                       staging is a DRY RUN: gwops issues from Let's Encrypt's staging CA, validates
+#                       the result (everything except the path to the registered root), reports
+#                       dry_run_ok in /status and NEVER installs it, because a Client does not trust
+#                       staging roots. Set production explicitly to serve the certificate. An
+#                       explicit URL equal to Let's Encrypt's staging directory counts as staging;
+#                       any other explicit URL is treated as production.
+#     provider          cloudflare (the only value, and the default)
+#     propagation       resolver (the default: the TXT record is checked through the container's
+#                       resolver only) or authoritative (also queries the zone's authoritative
+#                       nameservers, which needs outbound UDP/TCP 53)
+#     token_file        default /config/acme/cloudflare-token. A Cloudflare API token file under
+#                       /config/acme/ (symlinks must resolve inside it) with Zone:Read and DNS:Edit
+#                       on one zone only (see challenge_alias). It must be a non-empty regular
+#                       file. gwops only stats it and never reads it. The gateway process runs as
+#                       the same uid and can read it.
+#
+# gwops validates each pair (key matches, serverAuth, in date, SANs cover `names`, chain to the
+# registered root) before it installs it, and refuses a bad pair loudly, keeping the last good
+# one. To renew a source: file certificate, write new files at the same paths: the next pass
+# installs them and the gateway hot-reloads. A source: acme certificate is renewed by gwops (ARI,
+# or one third of the lifetime remaining; failures retry with a 15 min to 24 h backoff). Until its
+# first pair is installed it is not served: /status reports it pending, readiness reports
+# public_cert_pending, and the gateway stays held down while no certificate can be served.
+# POST /certs/public/{name}/issue forces an attempt. Not available in this mode: IP-addressed
+# upstreams or aliases, single-label names, and on-demand issuance. Mount the directories
+# read-only, one subdirectory per source: file certificate, and the token directory for ACME:
+#   - ./public-tls:/config/public-tls:ro
+#   - ./acme:/config/acme:ro
+# ACME also needs outbound HTTPS to the ACME directory and api.cloudflare.com, and the /data volume
+# (the account and the renewal schedule live in /data/acme).
+# public_tls:
+#   zones: ["example.com"]
+#   registered_root: isrg_root_x1
+#   certificates:
+#     - name: wildcard
+#       names: ["*.example.com"]
+#       source: file
+#       cert_file: /config/public-tls/wildcard/fullchain.pem
+#       key_file: /config/public-tls/wildcard/privkey.pem
+#
+# The same block with an ACME-issued certificate. First run it on staging (a dry run that installs
+# nothing); change directory to production once /status shows acme.state: dry_run_ok.
+# public_tls:
+#   zones: ["example.com"]
+#   registered_root: isrg_root_x1
+#   acme:
+#     email: ops@example.com
+#     accept_tos: true
+#     directory: staging               # staging (dry run) | production | https://...
+#     provider: cloudflare
+#     propagation: resolver            # resolver (default) | authoritative
+#     token_file: /config/acme/cloudflare-token
+#   certificates:
+#     - name: wildcard
+#       names: ["*.example.com"]
+#       source: acme
+#       # challenge_alias: acme-challenges.example.net   # optional CNAME-delegated challenge zone
+
+# --- SSH upstreams ---------------------------------------------------------------
+# One entry per SSH target the gateway fronts. gwops keeps one Twingate
+# sshResource per entry in sync. `address` is host or host:port (port defaults
+# to 22 at the gateway) and is normalized to lowercase on load (the Twingate API
+# lowercases addresses too, so this avoids permanent reconciler diff churn).
+# Names must be unique, [a-z0-9-]{1,63}.
+#
+# Any upstream (SSH, Kubernetes or web app) may carry an optional `access` block. A key set here
+# replaces twingate.resource_defaults for this resource (never merged with it);
+# `groups: []` means no groups even when defaults exist. gwops applies later changes as a
+# delta: it only removes groups it added itself and never resets the policy to Default.
+# Names must resolve to exactly one object, or that resource is reported as an error
+# (in /status) and not created.
+ssh_upstreams:
+  - name: web-1
+    address: 10.0.10.5:22
+    # access:
+    #   groups: ["Platform Engineers", {id: R3JvdXA6MTIz}]
+    #   security_policy: "Privileged Access MFA"
+  - name: build-box
+    address: build.internal.example.com
+
+# --- Kubernetes clusters ----------------------------------------------------------
+# The cluster API server the gateway fronts. The credential files named below must
+# exist and be mounted before the first start (or remove this block): a missing file is
+# refused loudly. The gateway binary supports exactly
+# one cluster: a second active entry loads but is refused when the gateway config is
+# rendered, so keep one entry. Credential files are referenced by
+# path — never inlined — and must resolve to a regular file (at most 1 MiB) under
+# /config/k8s-creds/; mount that directory read-only. Every reconcile copies each pair to
+# content-addressed files under /data/k8s-creds/ (<name>-token-<sha12>,
+# <name>-ca-<sha12>.crt), which is what the rendered gateway config points at, so a
+# changed credential restarts the gateway. `address` is normalized to lowercase on load,
+# same as ssh_upstreams.address above.
+k8s_clusters:
+  - name: prod
+    address: prod.k8s.internal  # API server host (no scheme)
+    port: 6443                  # API server port, 1-65535 (default 443)
+    bearer_token_file: /config/k8s-creds/prod.token
+    ca_file: /config/k8s-creds/prod-ca.crt
+  # To front a different cluster, replace the entry above with one of this shape (the
+  # port defaults to 443 when omitted). Do not add it alongside the entry above:
+  # - name: staging
+  #   address: staging.k8s.internal
+  #   port: 443
+  #   bearer_token_file: /config/k8s-creds/staging.token
+  #   ca_file: /config/k8s-creds/staging-ca.crt
+
+# --- Web apps ---------------------------------------------------------------------
+# One entry per internal web app the gateway fronts as an L7 reverse proxy. gwops keeps one
+# Twingate WebAppResource per entry in sync. Optional: leave the block out for no web apps.
+# `address` is host or host:port; the port is the upstream port the gateway dials (default
+# 443, or 80 when upstream_tls is none). Web-app policy (header names, templates, TLS modes)
+# is checked on every load; a violation is a local error and nothing is applied.
+# web_apps:
+#   - name: grafana
+#     address: grafana.apps.example.com:3000
+#     alias: grafana                # optional second client-facing host (no port, no `*`);
+#                                   #   omitted or null clears it on the tenant
+#     upstream_tls: verify_full     # verify_full (default) | verify_ca | insecure | none
+#     downstream:
+#       tls: tls13                  # tls13 (default) | none
+#       # port: 443                 # default 443 (tls13) or 80 (none)
+#     request_headers:              # per-resource header rewrites. Omit or null: unmanaged
+#       X-Env: prod                 #   (never sent). {}: managed and empty. A value is static
+#       # X-Debug-Geo: "{{clientGeoCountry}}"   #   text or one {{key}} template.
+#     # access:                     # same shape as for ssh_upstreams
+#     #   groups: ["Observability Users"]
+#
+# Gateway-wide web-app settings (seed-only; an overlay cannot set web_app_proxy).
+# web_app_proxy:
+#   request_headers:                # applied to every web app. A header whose template uses
+#     X-Twingate-User: "{{username}}"   #   username, groups or jwt is a trusted name: per-app
+#                                       #   rewrites may not set it, and its X_Twingate_User
+#                                       #   spelling is rendered too. {{jwt}} is refused here.
+#   upstream_ca_bundles:            # private CAs trusted for upstream TLS, added to the system
+#     - name: corp-root             #   roots. PEM, CERTIFICATE blocks only, CA:TRUE, in date.
+#       file: /config/webapp-cas/corp-root.pem   # must resolve under /config/webapp-cas/
+#   plaintext_upstreams:            # the only hosts allowed upstream_tls none or insecure;
+#     cidrs: ["10.20.0.0/16"]       #   absent allows none
+#     dns_suffixes: ["internal.example.com"]
+#   upstream_tls_probe: false       # opt-in (default false): after each pass gwops completes a
+#                                   #   TLS 1.3 handshake with each upstream whose upstream_tls is
+#                                   #   verify_full or verify_ca and reports it in /status; nothing
+#                                   #   is sent after it. Targets: declared web apps and unmanaged
+#                                   #   ones inside twingate.address_allowlist. Names resolving to
+#                                   #   loopback, link-local, unspecified or multicast addresses
+#                                   #   are never dialled. Dialled directly, ignoring
+#                                   #   HTTP(S)_PROXY and NO_PROXY. Read on every pass: a change
+#                                   #   takes effect on the next pass, no restart needed.
+
+# --- Session recording delivery ---------------------------------------------------
+# Optional, off by default. Session recordings and audit lines are shipped as NDJSON over
+# HTTP POST to a receiver you run (a SIEM ingest pipeline, a recording archive, ...); the
+# gateway's service logs are not. Lines ship as the gateway wrote them, so
+# request/response header values, URLs and terminal output reach the spool and the
+# receiver unredacted. With enabled: false nothing is spooled or shipped.
+# enabled: true requires receiver_url and GWOPS_RECORDING_TOKEN (bearer token, from the
+# environment, never from this file).
+recording:
+  enabled: false
+  receiver_url: https://recordings.example.com   # base URL; gwops POSTs to /ingest. Prefer
+                                            # https — plain http:// is accepted only for
+                                            # a trusted local network and logs a loud
+                                            # warning (token + recordings go in cleartext).
+  spool_max_bytes: 268435456                # recording spool bound (256 MiB),
+                                            # oldest-first eviction with a loud warning.
+                                            # Minimum 16777216 (16 MiB, the longest gateway
+                                            # line gwops accepts); a smaller value is
+                                            # refused at startup.
+
+# --- gwops admin API ----------------------------------------------------------------
+# Bearer-authenticated (GWOPS_ADMIN_TOKEN) control API. The code default is 127.0.0.1;
+# inside a container that is the container's own loopback, which a Docker published port
+# never reaches. compose.yaml publishes 8081 only on the host loopback, so the API stays
+# off the network. Outside Docker, keep 127.0.0.1.
+admin_api:
+  bind: 0.0.0.0
+  port: 8081
+  # automation:
+  #   name_prefix: auto-     # names the GWOPS_AUTOMATION_TOKEN caller may use
+  #   web_apps:                 # opt-in for the automation token to manage web apps
+  #     enabled: false          # default; false or absent: 403 on every web-app route
+  #     request_header_names: [] # rewrite names it may set (case-insensitive); empty = none.
+  #                              #   Even when enabled it is limited to upstream_tls verify_full,
+  #                              #   no {{jwt}} values, and an address and alias that no seed
+  #                              #   entry, overlay entry or tenant resource already uses.
